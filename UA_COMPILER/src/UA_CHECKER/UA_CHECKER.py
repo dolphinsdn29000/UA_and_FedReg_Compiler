@@ -1,490 +1,540 @@
 # UA_CHECKER.py
 # -------------------------------------------------------------
-# Verifies compiled UA CSVs are internally consistent and that
-# selected values line up with their source UA XML files.
+# Verifies compiled UA CSVs:
+# 1) The core check: for selected publication_ids, stream the XML,
+#    flatten each <RIN_INFO>, and compare EVERY field to the matching
+#    row in ua_rows.csv (same normalization as compiler).
+# 2) CK-last vs rows: ensure last_pub_ym equals the max pub_ym IN-WINDOW.
+# 3) Timetable latest: recompute from last issue only and compare.
+# 4) Blank rates for key columns.
 #
-# It DOES NOT msodify your compiled outputs.
-# It writes verification artifacts under <OUT_DIR>/_verify.
+# Artifacts under <OUT_DIR>/_verify:
+#   ua_verify_xml_vs_csv_detail.csv  (row-by-field diffs)
+#   ua_verify_xml_missing_columns.csv (xml fields unseen in csv columns)
+#   ua_verify_ck_vs_rows.csv
+#   ua_verify_timetable_mismatch.csv
+#   ua_verify_blank_rates.csv
+#   ua_verify_summary.txt
 #
-# Requires: pandas, lxml, python-dateutil e
+# Requires: pandas, lxml, python-dateutil
 # -------------------------------------------------------------
 
 import os
 import re
 import json
-from collections import defaultdict
 from datetime import datetime
-from dateutil import parser as dateparser
 
 import pandas as pd
 from lxml import etree
-
+from dateutil import parser as dateparser
 
 # =======================
-# 1) PATHS (hard-coded)
+# 1) PATHS (Tony’s env)
 # =======================
-UA_DIR = "/Users/tonymolino/Dropbox/Mac/Desktop/NEW_ML_REGULATIONS_PAPER 2/Unified_Agenda_Download/ua_main_data"
+UA_DIR  = "/Users/tonymolino/Dropbox/Mac/Desktop/NEW_ML_REGULATIONS_PAPER 2/Unified_Agenda_Download/ua_main_data"
 OUT_DIR = os.path.join(UA_DIR, "_ck_out")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# Compiled CSVs produced by your compiler
+# Compiled CSVs
 PATH_ROWS       = os.path.join(OUT_DIR, "ua_rows.csv")
 PATH_CK_LAST    = os.path.join(OUT_DIR, "ua_ck_last.csv")
 PATH_TIMETABLES = os.path.join(OUT_DIR, "ua_timetables.csv")
 
-# Where to write verification artifacts
 VERIFY_DIR = os.path.join(OUT_DIR, "_verify")
 os.makedirs(VERIFY_DIR, exist_ok=True)
 
-# XML files to trace (add/remove YYYYMM as you like)
+# XML files to trace deeply (you can add 2020–2024 here as desired)
 TRACE_PUB_YMS = [
-    "199510",  # Fall 1995
-    "200910",
-    "201710",
-    "202104",
-    "202410",
+    "199510", "200910", "201710", "201904", "202104", "202410",
 ]
 
+# ==================
+# 2) Normalization (match compiler)
+# ==================
+def t(x): return (x or "").strip()
 
-# ================
-# 2) UTILITIES
-# ================
-def pick_col(df: pd.DataFrame, candidates):
-    """Return the first column name from candidates that exists in df, else None."""
-    for c in candidates:
-        if c in df.columns:
-            return c
+def localname(tag: str) -> str:
+    return tag.split("}", 1)[-1] if tag else ""
+
+def snake(s: str) -> str:
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_").lower()
+
+_CANON = {
+    "title": "title",
+    "rule_title": "title",
+    "stage": "stage",
+    "rule_stage": "stage",
+    "priority": "priority",
+    "priority_category": "priority_category",
+    "publication_id": "publication_id",
+    "publication_title": "publication_title",
+    "rin": "rin",
+}
+def canon(col: str) -> str:
+    key = snake(col)
+    return _CANON.get(key, key)
+
+def parse_tt_date(raw):
+    s = t(raw)
+    if s == "" or s.lower().startswith(("to be","tbd")):
+        return s, ""
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    if m:
+        mm, dd, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not (1 <= mm <= 12):
+            return s, ""
+        if dd == 0:
+            dd = 1
+        return s, f"{yyyy:04d}-{mm:02d}-{dd:02d}"
+    m2 = re.match(r"^(\d{1,2})/(\d{4})$", s)
+    if m2:
+        mm, yyyy = int(m2.group(1)), int(m2.group(2))
+        if not (1 <= mm <= 12):
+            return s, ""
+        return s, f"{yyyy:04d}-{mm:02d}-01"
+    try:
+        dt = dateparser.parse(s, fuzzy=True, default=datetime(1900,1,1))
+        return s, dt.strftime("%Y-%m-%d")
+    except Exception:
+        return s, ""
+
+def publication_id_from_filename(xml_path: str) -> str:
+    m = re.search(r"REGINFO_RIN_DATA_(\d{6})\.xml$", os.path.basename(xml_path))
+    return m.group(1) if m else ""
+
+def as_json_str(obj):
+    def _default(o):
+        if isinstance(o, (datetime, pd.Timestamp)):
+            return str(o)
+        return str(o)
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=_default)
+    except TypeError:
+        return json.dumps(str(obj), ensure_ascii=False)
+
+# ------------- XML flatteners (namespace-agnostic) -------------
+_LIST_CONTAINERS = {
+    "agency_contact_list","timetable_list","legal_dline_list","cfr_list",
+    "legal_authority_list","small_entity_list","govt_level_list",
+    "related_rin_list","unfunded_mandate_list"
+}
+def iter_desc(elem):
+    yield elem
+    for d in elem.iterdescendants():
+        yield d
+
+def has_ancestor_named(el, names_lower_set):
+    p = el.getparent()
+    while p is not None:
+        if localname(p.tag).lower() in names_lower_set:
+            return True
+        p = p.getparent()
+    return False
+
+def first_desc_by_name(elem, name_lower, exclude_under=None):
+    ex = set(n.lower() for n in (exclude_under or []))
+    for d in elem.iter():
+        if localname(d.tag).lower() == name_lower:
+            if ex and has_ancestor_named(d, ex):
+                continue
+            return d
     return None
 
+def all_desc_by_name(elem, name_lower, exclude_under=None):
+    ex = set(n.lower() for n in (exclude_under or []))
+    for d in elem.iter():
+        if localname(d.tag).lower() == name_lower:
+            if ex and has_ancestor_named(d, ex):
+                continue
+            yield d
 
-def as_str_series(s: pd.Series) -> pd.Series:
-    """Convert any series to string with safeties."""
-    return s.astype("string").fillna(pd.NA)
+def flatten_rin_info(rin_info, source_xml, pub_ym):
+    rec = {"source_xml": os.path.basename(source_xml), "publication_id": pub_ym}
 
+    # RIN
+    rin_node = first_desc_by_name(rin_info, "rin")
+    rec["rin"] = t(rin_node.text) if rin_node is not None else ""
 
-def to_date_safe(x):
-    """Parse date strings robustly; return pd.NaT on failure."""
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return pd.NaT
-    if isinstance(x, (pd.Timestamp, datetime)):
-        return pd.to_datetime(x)
-    # UA often has placeholders like '10/00/1995' or 'To Be Determined'
-    txt = str(x).strip()
-    if not txt or txt.lower().startswith("to be"):
-        return pd.NaT
-    # Normalize 'MM/00/YYYY' => 'MM/15/YYYY' to get an approximate month anchor
-    m = re.match(r"^(\d{2})/00/(\d{4})$", txt)
-    if m:
-        txt = f"{m.group(1)}/15/{m.group(2)}"
-    try:
-        return pd.to_datetime(dateparser.parse(txt, fuzzy=True))
-    except Exception:
-        return pd.NaT
+    # Publication (optional inside)
+    pub = first_desc_by_name(rin_info, "publication", exclude_under=_LIST_CONTAINERS)
+    if pub is not None:
+        pid = first_desc_by_name(pub, "publication_id")
+        ptt = first_desc_by_name(pub, "publication_title")
+        if pid is not None:
+            rec["publication_id"] = t(pid.text)
+        if ptt is not None:
+            rec["publication_title"] = t(ptt.text)
 
+    # Agency / Parent agency
+    def _agency_block(block_name):
+        out = {}
+        blk = first_desc_by_name(rin_info, block_name, exclude_under={"agency_contact_list"})
+        if blk is None:
+            return out
+        code = first_desc_by_name(blk, "code")
+        name = first_desc_by_name(blk, "name")
+        acr  = first_desc_by_name(blk, "acronym")
+        out[f"{block_name}_code"]    = t(code.text) if code is not None else ""
+        out[f"{block_name}_name"]    = t(name.text) if name is not None else ""
+        out[f"{block_name}_acronym"] = t(acr.text)  if acr  is not None else ""
+        # shorthand names
+        if block_name == "agency" and "agency_name" in out:
+            out["agency"] = out["agency_name"]
+        if block_name == "parent_agency" and "parent_agency_name" in out:
+            out["parent_agency"] = out["parent_agency_name"]
+        return out
 
-def read_csv_safe(path: str) -> pd.DataFrame:
+    rec.update(_agency_block("agency"))
+    rec.update(_agency_block("parent_agency"))
+
+    # Lists
+    def _list_texts(list_tag, item_tag):
+        arr = []
+        for lst in all_desc_by_name(rin_info, list_tag):
+            for d in lst.iter():
+                if localname(d.tag).lower() == item_tag:
+                    if has_ancestor_named(d, {list_tag}) and not has_ancestor_named(d, {"agency_contact_list"}):
+                        arr.append(t(d.text))
+        return arr
+
+    def _related_rins():
+        out = []
+        for lst in all_desc_by_name(rin_info, "related_rin_list"):
+            for rr in lst.iter():
+                if localname(rr.tag).lower() != "related_rin":
+                    continue
+                rnode = first_desc_by_name(rr, "rin")
+                rel   = first_desc_by_name(rr, "rin_relation")
+                out.append({"rin": t(rnode.text) if rnode is not None else "",
+                            "relation": t(rel.text) if rel is not None else ""})
+        return out
+
+    def _contacts():
+        out = []
+        for cl in all_desc_by_name(rin_info, "agency_contact_list"):
+            for c in cl.iter():
+                if localname(c.tag).lower() != "contact":
+                    continue
+                item = {}
+                for tag in ["prefix","first_name","middle_name","last_name","title","phone","fax","email"]:
+                    node = first_desc_by_name(c, tag)
+                    if node is not None:
+                        item[tag] = t(node.text)
+                cag = first_desc_by_name(c, "agency")
+                if cag is not None:
+                    for tag in ["code","name","acronym"]:
+                        node = first_desc_by_name(cag, tag)
+                        item[f"contact_agency_{tag}"] = t(node.text) if node is not None else ""
+                addr = first_desc_by_name(c, "mailing_address")
+                if addr is not None:
+                    for tag in ["street_address","city","state","zip"]:
+                        node = first_desc_by_name(addr, tag)
+                        item[f"address_{tag}"] = t(node.text) if node is not None else ""
+                out.append(item)
+        return out
+
+    def _unfunded():
+        arr = []
+        for lst in all_desc_by_name(rin_info, "unfunded_mandate_list"):
+            for u in lst.iter():
+                if localname(u.tag).lower() == "unfunded_mandate":
+                    arr.append(t(u.text))
+        return arr
+
+    def _legal_deadlines():
+        out = []
+        for lst in all_desc_by_name(rin_info, "legal_dline_list"):
+            for info in lst.iter():
+                if localname(info.tag).lower() != "legal_dline_info":
+                    continue
+                d = {}
+                for tag in ["dline_type","dline_action_stage","dline_date","dline_desc"]:
+                    node = first_desc_by_name(info, tag)
+                    d[tag] = t(node.text) if node is not None else ""
+                out.append(d)
+        return out
+
+    def _timetable():
+        out = []
+        for lst in all_desc_by_name(rin_info, "timetable_list"):
+            for tt in lst.iter():
+                if localname(tt.tag).lower() != "timetable":
+                    continue
+                act = first_desc_by_name(tt, "ttbl_action") or first_desc_by_name(tt, "action")
+                dte = first_desc_by_name(tt, "ttbl_date")  or first_desc_by_name(tt, "date")
+                fr  = first_desc_by_name(tt, "fr_citation")
+                raw, iso = parse_tt_date(t(dte.text) if dte is not None else "")
+                out.append({
+                    "action": t(act.text) if act is not None else "",
+                    "date_raw": raw,
+                    "date_iso": iso,
+                    "fr_citation": t(fr.text) if fr is not None else ""
+                })
+        return out
+
+    rec["cfr_list"]              = as_json_str(_list_texts("cfr_list","cfr"))
+    rec["legal_authority_list"]  = as_json_str(_list_texts("legal_authority_list","legal_authority"))
+    rec["small_entity_list"]     = as_json_str(_list_texts("small_entity_list","small_entity"))
+    rec["govt_level_list"]       = as_json_str(_list_texts("govt_level_list","govt_level"))
+    rec["unfunded_mandate_list"] = as_json_str(_unfunded())
+    rec["related_rins"]          = as_json_str(_related_rins())
+    rec["contacts"]              = as_json_str(_contacts())
+
+    ld = _legal_deadlines()
+    rec["legal_deadline_list"] = as_json_str(ld)
+
+    tts = _timetable()
+    rec["timetable_all"] = as_json_str(tts)
+    # latest within issue
+    latest_iso, latest_action = "", ""
+    if tts:
+        tts_sorted = sorted(tts, key=lambda d: (d.get("date_iso",""), d.get("action","")))
+        latest_iso    = tts_sorted[-1].get("date_iso","") or ""
+        latest_action = tts_sorted[-1].get("action","")    or ""
+    rec["latest_action_date_in_issue"] = latest_iso
+    rec["latest_action_in_issue"]      = latest_action
+
+    # Scalar leaves outside list/agency/publication
+    exclude_anc = _LIST_CONTAINERS | {"agency","parent_agency","publication"}
+    for el in rin_info.iter():
+        if len(el) > 0:
+            continue
+        if has_ancestor_named(el, exclude_anc):
+            continue
+        ln = localname(el.tag)
+        if not ln or ln.lower() == "rin":
+            continue
+        key = canon(ln)
+        rec[key] = t(el.text)
+
+    # Canonical synonyms
+    if "rule_title" in rec and "title" not in rec:
+        rec["title"] = rec["rule_title"]
+    if "rule_stage" in rec and "stage" not in rec:
+        rec["stage"] = rec["rule_stage"]
+
+    return rec
+
+def read_csv_safe(path):
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"Expected file not found: {path}")
+        raise FileNotFoundError(path)
     try:
         return pd.read_csv(path, low_memory=False)
     except UnicodeDecodeError:
         return pd.read_csv(path, low_memory=False, encoding="latin-1")
 
+# ==========================
+# 3) Load compiled outputs
+# ==========================
+rows = read_csv_safe(PATH_ROWS)
+ck   = read_csv_safe(PATH_CK_LAST) if os.path.isfile(PATH_CK_LAST) else pd.DataFrame()
+tt   = read_csv_safe(PATH_TIMETABLES) if os.path.isfile(PATH_TIMETABLES) else pd.DataFrame()
 
-def publication_id_from_filename(xml_path: str) -> str:
-    """
-    Extract 'YYYYMM' from a filename like REGINFO_RIN_DATA_199510.xml -> '199510'
-    """
-    m = re.search(r"REGINFO_RIN_DATA_(\d{6})\.xml$", os.path.basename(xml_path))
-    return m.group(1) if m else ""
+# normalize identifiers
+if "rin" in rows.columns:
+    rows["rin"] = rows["rin"].astype(str).str.strip()
+if "publication_id" in rows.columns:
+    rows["publication_id"] = rows["publication_id"].astype(str).str.replace(r"\D","",regex=True)
 
+if not tt.empty:
+    tt["rin"] = tt["rin"].astype(str).str.strip()
+    tt["publication_id"] = tt["publication_id"].astype(str).str.replace(r"\D","",regex=True)
+    tt["_tt_date_iso"] = tt["ttbl_date_iso"].astype(str).fillna("")
 
-def localname(tag: str) -> str:
-    """Return the local-name of an XML tag without namespace."""
-    if tag is None:
-        return ""
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-    return tag
+# ==========================
+# 4) XML vs CSV deep check
+# ==========================
+xml_vs_csv_rows = []
+missing_columns_rows = []
 
+for pub_ym in TRACE_PUB_YMS:
+    xml_path = os.path.join(UA_DIR, f"REGINFO_RIN_DATA_{pub_ym}.xml")
+    if not os.path.isfile(xml_path):
+        xml_vs_csv_rows.append({
+            "publication_id": pub_ym, "rin": None, "field": None,
+            "xml_value": None, "csv_value": None,
+            "status": "XML file not found", "xml_path": xml_path
+        })
+        continue
 
-def text_of(elem):
-    return (elem.text or "").strip() if elem is not None else ""
+    # subset of rows for this issue, keyed by rin
+    issue_rows = rows[rows["publication_id"] == pub_ym].copy()
+    issue_idx  = issue_rows.set_index("rin") if not issue_rows.empty else pd.DataFrame()
 
-
-def first_nonempty(*vals):
-    for v in vals:
-        if v is not None and str(v).strip():
-            return v
-    return ""
-
-
-def iter_xml_rin_records(xml_path: str, sample_limit: int = None):
-    """
-    Streaming parse of a UA XML yielding one dict per <RIN_INFO>.
-    No use of local-name() in ElementPath to avoid InvalidPredicate errors.
-    """
-    pub_ym = publication_id_from_filename(xml_path)
-    # We parse all end events and filter on localname == 'RIN_INFO'
-    ctx = etree.iterparse(xml_path, events=("end",), recover=True)
-    count = 0
-
-    for ev, elem in ctx:
-        if localname(elem.tag) != "RIN_INFO":
-            # memory hygiene while skipping
-            if elem.getparent() is not None:
-                elem.clear()
-                while elem.getprevious() is not None:
-                    del elem.getparent()[0]
+    ctx = etree.iterparse(xml_path, events=("end",), recover=True, huge_tree=True)
+    for ev, el in ctx:
+        if localname(el.tag).lower() != "rin_info":
             continue
 
-        # Now we are on a RIN_INFO container
-        rin = text_of(elem.find("RIN"))
-        if not rin:
-            # Sometimes RIN might be nested oddly; try a safe scan
-            cand = elem.find(".//RIN")
-            rin = text_of(cand)
-        if not rin:
-            # clean and continue
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
-            if sample_limit and count >= sample_limit:
-                break
+        pub_from_name = publication_id_from_filename(xml_path)
+        rec_xml = flatten_rin_info(el, xml_path, pub_from_name)
+        rin = rec_xml.get("rin","")
+        if rin == "":
+            el.clear()
+            while el.getprevious() is not None:
+                del el.getparent()[0]
             continue
 
-        # Common fields (per examples in 199510 and 202410 files)
-        # RULE_TITLE
-        rule_title = first_nonempty(
-            text_of(elem.find("RULE_TITLE")),
-            text_of(elem.find(".//RULE_TITLE")),
-            text_of(elem.find("TITLE")),
-            text_of(elem.find(".//TITLE"))
-        )
+        # Compare to CSV row: same (rin, publication_id)
+        if not issue_rows.empty and rin in issue_idx.index:
+            row = issue_idx.loc[rin]
+            if isinstance(row, pd.DataFrame):  # rare duplicate rows (shouldn't happen)
+                row = row.head(1).iloc[0]
+            # For every XML field
+            for k_xml, v_xml in rec_xml.items():
+                if k_xml in {"source_xml"}:
+                    continue
+                if k_xml not in rows.columns:
+                    missing_columns_rows.append({
+                        "publication_id": pub_ym, "rin": rin, "missing_column": k_xml,
+                        "xml_example_value": v_xml
+                    })
+                    status = "missing_in_csv_columns"
+                    xml_vs_csv_rows.append({
+                        "publication_id": pub_ym, "rin": rin, "field": k_xml,
+                        "xml_value": v_xml, "csv_value": "",
+                        "status": status, "xml_path": xml_path
+                    })
+                    continue
+                v_csv = row.get(k_xml, "")
+                # Normalize JSON lists for comparison
+                if k_xml.endswith("_list") or k_xml in {"contacts","related_rins","timetable_all"}:
+                    try:
+                        A = json.loads(v_xml) if isinstance(v_xml, str) else v_xml
+                    except Exception:
+                        A = str(v_xml)
+                    try:
+                        B = json.loads(v_csv) if isinstance(v_csv, str) else v_csv
+                    except Exception:
+                        B = str(v_csv)
+                    # Basic comparison; could be enhanced to ignore ordering if needed
+                    equal = (A == B)
+                    status = "match" if equal else "mismatch"
+                else:
+                    status = "match" if str(v_csv).strip() == str(v_xml).strip() else "mismatch"
 
-        # Agency names
-        agency_name = first_nonempty(
-            text_of(elem.find("AGENCY/NAME")),
-            text_of(elem.find(".//AGENCY/NAME")),
-            text_of(elem.find("AGENCY"))
-        )
-        parent_agency_name = first_nonempty(
-            text_of(elem.find("PARENT_AGENCY/NAME")),
-            text_of(elem.find(".//PARENT_AGENCY/NAME")),
-            text_of(elem.find("PARENT_AGENCY"))
-        )
-
-        # Rule stage
-        rule_stage = first_nonempty(
-            text_of(elem.find("RULE_STAGE")),
-            text_of(elem.find(".//RULE_STAGE")),
-            text_of(elem.find("STAGE")),
-            text_of(elem.find(".//STAGE"))
-        )
-
-        # Timetable list
-        timetables = []
-        for tt in elem.findall("TIMETABLE_LIST/TIMETABLE"):
-            action = first_nonempty(text_of(tt.find("TTBL_ACTION")),
-                                    text_of(tt.find("ACTION")))
-            date_s = first_nonempty(text_of(tt.find("TTBL_DATE")),
-                                    text_of(tt.find("DATE")))
-            fr_cit = text_of(tt.find("FR_CITATION"))
-            timetables.append({
-                "action": action,
-                "date": date_s,
-                "fr_citation": fr_cit
+                xml_vs_csv_rows.append({
+                    "publication_id": pub_ym, "rin": rin, "field": k_xml,
+                    "xml_value": v_xml, "csv_value": v_csv,
+                    "status": status, "xml_path": xml_path
+                })
+        else:
+            # No CSV row for this RIN/issue
+            xml_vs_csv_rows.append({
+                "publication_id": pub_ym, "rin": rin, "field": None,
+                "xml_value": None, "csv_value": None,
+                "status": "CSV row not found for (rin, publication_id)",
+                "xml_path": xml_path
             })
 
-        yield {
-            "pub_ym": pub_ym,
-            "rin": rin,
-            "xml_title": rule_title,
-            "xml_agency": agency_name,
-            "xml_parent_agency": parent_agency_name,
-            "xml_rule_stage": rule_stage,
-            "xml_timetable": timetables,
-            "xml_path": xml_path
-        }
+        # memory hygiene
+        el.clear()
+        while el.getprevious() is not None:
+            del el.getparent()[0]
 
-        count += 1
+# Write deep-compare artifacts
+xml_vs_csv_df = pd.DataFrame(xml_vs_csv_rows)
+xml_vs_csv_out = os.path.join(VERIFY_DIR, "ua_verify_xml_vs_csv_detail.csv")
+xml_vs_csv_df.to_csv(xml_vs_csv_out, index=False)
 
-        # memory hygiene after finishing a RIN_INFO container
-        elem.clear()
-        while elem.getprevious() is not None:
-            del elem.getparent()[0]
+missing_cols_df = pd.DataFrame(missing_columns_rows).drop_duplicates()
+missing_cols_out = os.path.join(VERIFY_DIR, "ua_verify_xml_missing_columns.csv")
+missing_cols_df.to_csv(missing_cols_out, index=False)
 
-        if sample_limit is not None and count >= sample_limit:
-            break
-
-
-# =====================================
-# 3) LOAD DATA (compiled CSV outputs)
-# =====================================
-rows = read_csv_safe(PATH_ROWS)
-ck   = read_csv_safe(PATH_CK_LAST)
-tt   = read_csv_safe(PATH_TIMETABLES)
-
-# Normalize id columns across files
-col_rin_rows = pick_col(rows, ["rin", "RIN"])
-col_rin_ck   = pick_col(ck,   ["rin", "RIN"])
-col_rin_tt   = pick_col(tt,   ["rin", "RIN"])
-
-if not (col_rin_rows and col_rin_ck and col_rin_tt):
-    raise RuntimeError("Could not find 'rin' column in one or more CSVs.")
-
-rows[col_rin_rows] = as_str_series(rows[col_rin_rows]).str.strip()
-ck[col_rin_ck]     = as_str_series(ck[col_rin_ck]).str.strip()
-tt[col_rin_tt]     = as_str_series(tt[col_rin_tt]).str.strip()
-
-# Publication ids (YYYYMM)
-col_pub_rows = pick_col(rows, ["publication_id", "pub_ym", "pubym", "publicationId"])
-col_pub_ck   = pick_col(ck,   ["last_pub_ym", "pub_ym", "publication_id"])
-col_pub_tt   = pick_col(tt,   ["publication_id", "pub_ym"])
-
-if not col_pub_rows:
-    raise RuntimeError("Could not find publication_id column in ua_rows.csv.")
-
-rows[col_pub_rows] = as_str_series(rows[col_pub_rows]).str.replace(r"\D", "", regex=True)
-if col_pub_ck:
-    ck[col_pub_ck] = as_str_series(ck[col_pub_ck]).str.replace(r"\D", "", regex=True)
-if col_pub_tt:
-    tt[col_pub_tt] = as_str_series(tt[col_pub_tt]).str.replace(r"\D", "", regex=True)
-
-# Timetable date columns
-col_tt_date   = pick_col(tt, ["ttbl_date", "date", "timetable_date"])
-col_tt_action = pick_col(tt, ["ttbl_action", "action", "timetable_action"])
-if col_tt_date:
-    tt["_tt_date"] = tt[col_tt_date].apply(to_date_safe)
-
-
-# ======================================
-# 4) CHECK A: CK-last vs true last issue
-# ======================================
-# For each RIN, compute the true last (max) publication_id observed in ua_rows.csv
-rows_last = (rows
-             .groupby(col_rin_rows)[col_pub_rows]
-             .max()
-             .reset_index()
-             .rename(columns={col_pub_rows: "rows_max_pub_ym"}))
-
-ck_key = col_pub_ck or "pub_ym"  # fallback if older variant
-if ck_key not in ck.columns:
-    ck["last_pub_ym_in_ck"] = pd.NA
+# ==========================
+# 5) CK vs Rows (last issue)
+# ==========================
+ck_vs_rows_out = os.path.join(VERIFY_DIR, "ua_verify_ck_vs_rows.csv")
+if not ck.empty and "last_pub_ym" in ck.columns:
+    rows_last = (rows.groupby("rin")["publication_id"].max().reset_index()
+                 .rename(columns={"publication_id":"rows_max_pub_ym"}))
+    ck_check = ck[["rin","last_pub_ym"]].merge(rows_last, on="rin", how="left")
+    ck_check["pub_ym_mismatch"] = ck_check["last_pub_ym"].fillna("") != ck_check["rows_max_pub_ym"].fillna("")
+    ck_check[ck_check["pub_ym_mismatch"] == True].to_csv(ck_vs_rows_out, index=False)
 else:
-    ck["last_pub_ym_in_ck"] = ck[ck_key]
+    pd.DataFrame().to_csv(ck_vs_rows_out, index=False)
 
-ck_last_check = (ck[[col_rin_ck, "last_pub_ym_in_ck"]]
-                 .merge(rows_last, left_on=col_rin_ck, right_on=col_rin_rows, how="left"))
+# ============================================
+# 6) Timetable latest (last issue only) check
+# ============================================
+tt_mismatch_out = os.path.join(VERIFY_DIR, "ua_verify_timetable_mismatch.csv")
+if not ck.empty and not rows.empty and not tt.empty:
+    # For each RIN in CK, take the last_pub_ym and compare tt latest to CK fields
+    ck_use = ck[["rin","last_pub_ym","latest_action_last_issue","latest_action_date_last_issue"]].copy()
+    # derive last-issue timetable from the long table
+    join = tt.merge(ck_use[["rin","last_pub_ym"]], left_on=["rin","publication_id"], right_on=["rin","last_pub_ym"], how="inner")
+    # rank by iso date then action to stabilize
+    join = join.sort_values(["rin","ttbl_date_iso","ttbl_action"])
+    last_by_rin = join.groupby("rin").tail(1)
+    last_map_date = dict(zip(last_by_rin["rin"], last_by_rin["ttbl_date_iso"]))
+    last_map_act  = dict(zip(last_by_rin["rin"], last_by_rin["ttbl_action"]))
 
-ck_last_check["pub_ym_mismatch"] = ck_last_check["last_pub_ym_in_ck"].fillna("") != ck_last_check["rows_max_pub_ym"].fillna("")
-mismatch_ck = ck_last_check[ck_last_check["pub_ym_mismatch"] == True].copy()
+    ck_use["tt_latest_date_from_long"]   = ck_use["rin"].map(last_map_date).fillna("")
+    ck_use["tt_latest_action_from_long"] = ck_use["rin"].map(last_map_act).fillna("")
 
-mismatch_ck_out = os.path.join(VERIFY_DIR, "ua_verify_ck_vs_rows.csv")
-mismatch_ck.sort_values([col_rin_ck]).to_csv(mismatch_ck_out, index=False)
+    ck_use["date_mismatch"]   = ck_use["latest_action_date_last_issue"].astype(str).str.strip() != ck_use["tt_latest_date_from_long"].astype(str).str.strip()
+    ck_use["action_mismatch"] = ck_use["latest_action_last_issue"].astype(str).str.strip()       != ck_use["tt_latest_action_from_long"].astype(str).str.strip()
 
-
-# =================================================
-# 5) CHECK B: latest timetable vs latest_* in CK
-# =================================================
-tt_latest = None
-if col_tt_date:
-    tt_latest = (tt
-                 .dropna(subset=["_tt_date"])
-                 .sort_values(["_tt_date"])
-                 .groupby(col_rin_tt)
-                 .agg(tt_latest_date=("_tt_date", "max"),
-                      tt_latest_action=(col_tt_action, "last"))
-                 .reset_index())
-    tt_latest["tt_latest_date"] = pd.to_datetime(tt_latest["tt_latest_date"]).dt.normalize()
-
-col_latest_date_ck = pick_col(ck, ["latest_action_date", "last_action_date", "latest_date"])
-col_latest_act_ck  = pick_col(ck, ["latest_action", "last_action", "latest_action_name"])
-
-if tt_latest is not None and col_latest_date_ck:
-    ck["_ck_latest_date"] = pd.to_datetime(ck[col_latest_date_ck].apply(to_date_safe)).dt.normalize()
-    if col_latest_act_ck:
-        ck["_ck_latest_action"] = ck[col_latest_act_ck].astype("string")
-
-    tt_merge = (ck[[col_rin_ck, "_ck_latest_date", "_ck_latest_action"]]
-                .merge(tt_latest, left_on=col_rin_ck, right_on=col_rin_tt, how="left"))
-
-    tt_merge["latest_date_mismatch"] = (tt_merge["_ck_latest_date"].fillna(pd.NaT) != tt_merge["tt_latest_date"].fillna(pd.NaT))
-
-    def _norm(s):
-        return ("" if s is None or (isinstance(s, float) and pd.isna(s)) else str(s)).strip().lower()
-
-    if col_latest_act_ck:
-        tt_merge["latest_action_mismatch"] = tt_merge.apply(
-            lambda r: _norm(r.get("_ck_latest_action")) != _norm(r.get("tt_latest_action")),
-            axis=1
-        )
-    else:
-        tt_merge["latest_action_mismatch"] = pd.NA
-
-    tt_mismatch = tt_merge[(tt_merge["latest_date_mismatch"] == True) |
-                           (tt_merge["latest_action_mismatch"] == True)].copy()
-    tt_mismatch_out = os.path.join(VERIFY_DIR, "ua_verify_timetable_mismatch.csv")
-    tt_mismatch.sort_values([col_rin_ck]).to_csv(tt_mismatch_out, index=False)
+    ck_use[(ck_use["date_mismatch"] | ck_use["action_mismatch"])].to_csv(tt_mismatch_out, index=False)
 else:
-    tt_mismatch_out = None
+    pd.DataFrame().to_csv(tt_mismatch_out, index=False)
 
-
-# =========================================
-# 6) CHECK C: blank-rate for key columns
-# =========================================
+# ==========================
+# 7) Blank-rate snapshot
+# ==========================
 def blank_share(df: pd.DataFrame, cols):
     out = []
     n = len(df)
     for c in cols:
         if c in df.columns:
-            blank = df[c].isna() | (df[c].astype("string").str.strip() == "")
+            blank = df[c].isna() | (df[c].astype(str).str.strip() == "")
             out.append({"column": c, "blank_count": int(blank.sum()), "blank_pct": float(blank.mean())})
     return pd.DataFrame(out)
 
-agency_col_ck        = pick_col(ck,   ["agency", "AGENCY", "Agency"])
-parent_agency_col_ck = pick_col(ck,   ["parent_agency", "Parent_Agency", "PARENT_AGENCY", "Parent-Agency"])
-deadline_cols_ck     = [c for c in ck.columns if ("deadline" in c.lower()) or ("legal" in c.lower())]
-
-blank_df = blank_share(ck, [c for c in [agency_col_ck, parent_agency_col_ck] if c] + deadline_cols_ck)
+blank_cols = [c for c in ["agency","parent_agency","legal_deadline_list"] if c in ck.columns]
+blank_df = blank_share(ck, blank_cols)
 blank_out = os.path.join(VERIFY_DIR, "ua_verify_blank_rates.csv")
 blank_df.to_csv(blank_out, index=False)
 
+# ==========================
+# 8) Human summary
+# ==========================
+lines = []
+lines.append("=== UA Verification Summary ===")
+if os.path.isfile(xml_vs_csv_out):
+    df = pd.read_csv(xml_vs_csv_out, low_memory=False)
+    n_total = len(df)
+    n_mismatch = (df["status"] == "mismatch").sum()
+    n_missing_cols = (df["status"] == "missing_in_csv_columns").sum()
+    n_notfound = (df["status"].str.contains("not found", na=False)).sum()
+    lines.append(f"XML vs CSV detail rows: {n_total:,}")
+    lines.append(f"  mismatches: {n_mismatch:,}; missing columns: {n_missing_cols:,}; not-found rows/files: {n_notfound:,}")
+    lines.append(f"  -> Detail: {xml_vs_csv_out}")
+if os.path.isfile(missing_cols_out):
+    lines.append(f"XML fields missing as CSV columns (unique rows): {len(missing_cols_df):,}")
+    lines.append(f"  -> Detail: {missing_cols_out}")
 
-# ==========================================
-# 7) CHECK D: XML trace-back (spot checks)
-# ==========================================
-def get_xml_path_for_pubym(pub_ym: str) -> str:
-    return os.path.join(UA_DIR, f"REGINFO_RIN_DATA_{pub_ym}.xml")
+if os.path.isfile(ck_vs_rows_out):
+    mism = pd.read_csv(ck_vs_rows_out)
+    lines.append(f"CK vs Rows (last pub_ym mismatches): {len(mism):,}")
+    lines.append(f"  -> Detail: {ck_vs_rows_out}")
 
-xml_trace_rows = []
-SAMPLE_PER_XML = 12
+if os.path.isfile(tt_mismatch_out):
+    tm = pd.read_csv(tt_mismatch_out)
+    lines.append(f"Timetable latest mismatches (last issue only): {len(tm):,}")
+    lines.append(f"  -> Detail: {tt_mismatch_out}")
 
-if col_pub_rows:
-    # small in-memory indices to speed lookups
-    ck_idx = ck.set_index(col_rin_ck, drop=False) if col_rin_ck in ck.columns else None
-
-    tt_idx = None
-    if col_tt_date:
-        tt_idx = tt.copy()
-        tt_idx["_tt_date"] = tt_idx[col_tt_date].apply(to_date_safe)
-        tt_idx = tt_idx.set_index(col_rin_tt, drop=False)
-
-    for pub_ym in TRACE_PUB_YMS:
-        xml_path = get_xml_path_for_pubym(pub_ym)
-        if not os.path.isfile(xml_path):
-            xml_trace_rows.append({
-                "pub_ym": pub_ym,
-                "rin": None,
-                "xml_path": xml_path,
-                "trace_note": f"XML file not found for pub_ym={pub_ym}"
-            })
-            continue
-
-        sample_rins = (rows[rows[col_pub_rows] == pub_ym][col_rin_rows]
-                       .dropna()
-                       .astype("string")
-                       .str.strip()
-                       .unique())
-        sample_rins = list(sample_rins[:SAMPLE_PER_XML])
-
-        # parse XML streaming and capture matches
-        seen = set()
-        for rec in iter_xml_rin_records(xml_path):
-            r = rec["rin"]
-            if r in sample_rins and r not in seen:
-                seen.add(r)
-
-                row_issue = rows[(rows[col_rin_rows] == r) & (rows[col_pub_rows] == pub_ym)].head(1)
-
-                ck_row = ck_idx.loc[r] if (ck_idx is not None and r in ck_idx.index) else None
-
-                # latest timetable from long file
-                csv_latest_date, csv_latest_action = None, None
-                if tt_idx is not None and r in tt_idx.index and "_tt_date" in tt_idx.columns:
-                    tt_sub = tt_idx.loc[[r]] if isinstance(tt_idx.loc[r], pd.DataFrame) else tt_idx.loc[r].to_frame().T
-                    tt_sub = tt_sub.dropna(subset=["_tt_date"]).sort_values("_tt_date")
-                    if not tt_sub.empty:
-                        csv_latest_date = tt_sub["_tt_date"].iloc[-1]
-                        ac_col = col_tt_action or "ttbl_action"
-                        csv_latest_action = tt_sub[ac_col].iloc[-1] if ac_col in tt_sub.columns else None
-
-                xml_trace_rows.append({
-                    "rin": r,
-                    "pub_ym": pub_ym,
-                    "xml_path": xml_path,
-                    "xml_title": rec["xml_title"],
-                    "xml_agency": rec["xml_agency"],
-                    "xml_parent_agency": rec["xml_parent_agency"],
-                    "xml_rule_stage": rec["xml_rule_stage"],
-                    "xml_timetable_count": len(rec["xml_timetable"]),
-                    "csv_agency": (row_issue.get(agency_col_ck).iloc[0] if (agency_col_ck and not row_issue.empty and agency_col_ck in row_issue.columns) else None),
-                    "csv_parent_agency": (row_issue.get(parent_agency_col_ck).iloc[0] if (parent_agency_col_ck and not row_issue.empty and parent_agency_col_ck in row_issue.columns) else None),
-                    "ck_latest_action_date": (str(ck_row[col_latest_date_ck]) if (ck_row is not None and col_latest_date_ck in ck_row) else None),
-                    "ck_latest_action": (ck_row[col_latest_act_ck] if (ck_row is not None and col_latest_act_ck in ck_row) else None),
-                    "csv_latest_ttbl_date": (str(csv_latest_date) if csv_latest_date is not None else None),
-                    "csv_latest_ttbl_action": (str(csv_latest_action) if csv_latest_action is not None else None),
-                    "trace_note": ""
-                })
-
-        # any sampled RIN not seen = potential parse miss
-        for r in sample_rins:
-            if r not in {row["rin"] for row in xml_trace_rows if row["pub_ym"] == pub_ym}:
-                xml_trace_rows.append({
-                    "rin": r, "pub_ym": pub_ym, "xml_path": xml_path,
-                    "trace_note": "RIN not found in XML (parser miss or true absence)"
-                })
-
-# Write XML trace results
-xml_trace_df = pd.DataFrame(xml_trace_rows)
-xml_trace_out = os.path.join(VERIFY_DIR, "ua_verify_xml_trace.csv")
-xml_trace_df.to_csv(xml_trace_out, index=False)
-
-
-# ==========================================
-# 8) HUMAN-READABLE SUMMARY
-# ==========================================
-n_issue_rows   = len(rows)
-n_ck_rows      = len(ck)
-n_tt_rows      = len(tt)
-n_rin_issue    = rows[col_rin_rows].nunique()
-n_rin_ck       = ck[col_rin_ck].nunique()
-
-summary_lines = []
-summary_lines.append("=== UA Verification Summary ===")
-summary_lines.append(f"ua_rows.csv:       rows={n_issue_rows:,}  distinct RINs={n_rin_issue:,}")
-summary_lines.append(f"ua_ck_last.csv:    rows={n_ck_rows:,}     distinct RINs={n_rin_ck:,}")
-summary_lines.append(f"ua_timetables.csv: rows={n_tt_rows:,}")
-summary_lines.append("")
-
-# Mismatch counts
-summary_lines.append(f"CK vs Rows (last pub_ym mismatches): {len(mismatch_ck):,}")
-if len(mismatch_ck) > 0:
-    summary_lines.append(f"  -> Details: {mismatch_ck_out}")
-
-if tt_mismatch_out and os.path.isfile(tt_mismatch_out):
-    tt_m = pd.read_csv(tt_mismatch_out)
-    summary_lines.append(f"Timetable latest mismatches: {len(tt_m):,}")
-    summary_lines.append(f"  -> Details: {tt_mismatch_out}")
-else:
-    summary_lines.append("Timetable latest mismatches: (check skipped – date columns missing)")
-
-summary_lines.append("")
-summary_lines.append("Blank-rate snapshot in ua_ck_last (selected columns):")
-if not blank_df.empty:
+if os.path.isfile(blank_out):
+    lines.append("Blank-rate snapshot (CK-last):")
     for _, r in blank_df.iterrows():
-        summary_lines.append(f"  {r['column']}: blanks={int(r['blank_count']):,} ({r['blank_pct']:.1%})")
-    summary_lines.append(f"  -> Details: {blank_out}")
-else:
-    summary_lines.append("  (no candidate blank columns found)")
-
-summary_lines.append("")
-summary_lines.append("XML spot-check trace:")
-summary_lines.append(f"  XML trace rows: {len(xml_trace_df):,}")
-summary_lines.append(f"  -> Details: {xml_trace_out}")
+        lines.append(f"  {r['column']}: blanks={int(r['blank_count']):,} ({r['blank_pct']:.1%})")
+    lines.append(f"  -> Detail: {blank_out}")
 
 summary_txt = os.path.join(VERIFY_DIR, "ua_verify_summary.txt")
 with open(summary_txt, "w", encoding="utf-8") as f:
-    f.write("\n".join(summary_lines))
+    f.write("\n".join(lines))
 
-print("\n".join(summary_lines))
+print("\n".join(lines))
 print(f"\nVerification artifacts written under: {VERIFY_DIR}")

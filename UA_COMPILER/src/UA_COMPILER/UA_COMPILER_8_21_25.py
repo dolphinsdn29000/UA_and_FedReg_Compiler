@@ -1,17 +1,20 @@
-# UA_COMPILER_8_22_25.py
+# UA_COMPILER.py
 # -------------------------------------------------------------
 # Unified Agenda compiler (CK-like), with dynamic column union.
-# - Brings ALL fields encountered across all XMLs (1995..)
-# - Preserves list blocks as JSON strings in CSV
-# - Computes CK "last" strictly from the RIN's last publication
-# - Latest timetable fields come ONLY from the last issue
+# - Brings EVERY scalar leaf encountered across ALL XMLs
+#   (1995..latest) into ua_rows.csv and into CK-last outputs.
+# - Preserves list blocks as JSON strings in CSVs.
+# - Computes per-issue timetable + "latest" within that issue.
+# - Builds CK-last for the CK window (199510–201904) and a
+#   "last over full range" file for all available years.
 #
 # Outputs under <OUT_DIR>:
-#   ua_rows.csv                (per issue)
-#   ua_timetables.csv          (long-form timetable)
-#   ua_ck_last.csv             (one row per RIN; backfill + last-issue timetable)
-#   ua_ck_counts.csv           (counts by year/season)
-#   ua_yearly_counts.png       (chart)
+#   ua_rows.csv
+#   ua_timetables.csv
+#   ua_ck_last.csv       (CK window 199510–201904)
+#   ua_last_full.csv     (all available years, through 2024+)
+#   ua_ck_counts.csv     (counts per publication_id YYYYMM)
+#   ua_yearly_counts.png (Spring/Fall series)
 #
 # Requires: pandas, lxml, python-dateutil, matplotlib
 # -------------------------------------------------------------
@@ -19,61 +22,83 @@
 import os
 import re
 import json
-import math
-from collections import defaultdict, Counter
 from datetime import datetime
-from dateutil import parser as dateparser
+from collections import defaultdict
 
 import pandas as pd
 from lxml import etree
+from dateutil import parser as dateparser
 
 import matplotlib
-matplotlib.use("Agg")  # headlesså
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 # =======================
-# 1) PATHS (hard-coded)
+# 1) PATHS (Tony’s env)
 # =======================
-UA_DIR  = "/Users/tonymolino/Dropbox/Mac/Desktop/PyProjects/UA_and_FEG_REG_COMPILER/UA_COMPILER/Unified_Agenda_xml_Data"
-OUT_DIR = "/Users/tonymolino/Dropbox/Mac/Desktop/PyProjects/UA_and_FEG_REG_COMPILER/UA_COMPILER/UA_COMPILER_OUTPUT_DATA"
+UA_DIR  = "/Users/tonymolino/Dropbox/Mac/Desktop/NEW_ML_REGULATIONS_PAPER 2/Unified_Agenda_Download/ua_main_data"
+OUT_DIR = os.path.join(UA_DIR, "_ck_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-CK_START = "199510"   # CK window start (inclusive)
-CK_END   = "201912"   # CK window end   (inclusive)
+# CK window (inclusive)
+CK_START = "199510"
+CK_END   = "201904"
 
-# ------------- Helpers -------------
-def localname(tag):
-    if tag is None:
-        return ""
-    # '{ns}NAME' -> 'NAME'
-    return tag.split("}")[-1]
-
+# ---------------- Helpers ----------------
 def t(x):  # safe text
     return (x or "").strip()
 
+def localname(tag: str) -> str:
+    if not tag:
+        return ""
+    return tag.split("}", 1)[-1]
+
+def snake(s: str) -> str:
+    """lower-snake-case for tag/field names"""
+    if s is None:
+        return ""
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_").lower()
+
+# Canonical aliases so legacy names collapse to a consistent column
+_CANON = {
+    "title": "title",
+    "rule_title": "title",
+    "stage": "stage",
+    "rule_stage": "stage",
+    "priority": "priority",
+    "priority_category": "priority_category",
+    "publication_id": "publication_id",
+    "publication_title": "publication_title",
+    "rin": "rin",
+}
+
+def canon(col: str) -> str:
+    key = snake(col)
+    return _CANON.get(key, key)
+
 def to_pub_ym_from_file(fname):
     m = re.search(r"REGINFO_RIN_DATA_(\d{6})\.xml$", os.path.basename(fname))
-    return m.group(1) if m else None
+    return m.group(1) if m else ""
+
+def pub_season(ym):
+    if not ym or len(ym) != 6 or not ym.isdigit():
+        return ""
+    return "Spring" if ym[4:] == "04" else ("Fall" if ym[4:] == "10" else "")
 
 def parse_tt_date(raw):
     """
-    Parse UA 'TTBL_DATE', which can be:
-      - 'MM/DD/YYYY', 'MM/00/YYYY', 'MM/YYYY', 'To Be Determined', '', etc.
-    Return tuple: (raw_str, iso_date_or_blank)
-    We keep raw intact; for comparisons we coerce:
-      - 'MM/00/YYYY' -> YYYY-MM-01
-      - 'MM/YYYY'    -> YYYY-MM-01
-      - unparseable  -> ''
+    UA TIMETABLE date can be 'MM/DD/YYYY', 'MM/00/YYYY', 'MM/YYYY', 'TBD', etc.
+    Return (raw, iso 'YYYY-MM-DD' or '').
     """
     s = t(raw)
-    if s == "" or s.lower().startswith("to be"):
+    if s == "" or s.lower().startswith(("to be", "tbd")):
         return s, ""
-    # Standardize single slashes; accept e.g., 10/00/1995
     m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
     if m:
         mm, dd, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if mm < 1 or mm > 12:
+        if not (1 <= mm <= 12):
             return s, ""
         if dd == 0:
             dd = 1
@@ -81,269 +106,319 @@ def parse_tt_date(raw):
     m2 = re.match(r"^(\d{1,2})/(\d{4})$", s)
     if m2:
         mm, yyyy = int(m2.group(1)), int(m2.group(2))
-        if mm < 1 or mm > 12:
+        if not (1 <= mm <= 12):
             return s, ""
         return s, f"{yyyy:04d}-{mm:02d}-01"
-    # Fallback parser; may or may not succeed
     try:
-        dt = dateparser.parse(s, fuzzy=True, default=datetime(1900,1,1))
+        dt = dateparser.parse(s, fuzzy=True, default=datetime(1900, 1, 1))
         return s, dt.strftime("%Y-%m-%d")
     except Exception:
         return s, ""
 
-def pub_season(ym):
-    if not ym or len(ym) != 6 or not ym.isdigit():
-        return ""
-    return "Spring" if ym[4:] == "04" else ("Fall" if ym[4:] == "10" else "")
-
 def as_json_str(obj):
-    # Ensure timestamps, dates, numpy types become strings
-    def default(o):
+    def _default(o):
         if isinstance(o, (datetime, pd.Timestamp)):
             return str(o)
         return str(o)
     try:
-        return json.dumps(obj, ensure_ascii=False, default=default)
+        return json.dumps(obj, ensure_ascii=False, default=_default)
     except TypeError:
-        # Last resort: stringify
         return json.dumps(str(obj), ensure_ascii=False)
 
-# ---- Extraction for structured subtrees ----
-def extract_publication(elem):
+# ---------- Namespace-agnostic finders ----------
+def iter_desc(elem):
+    """Yield all descendants including self (namespace-agnostic)."""
+    yield elem
+    for ch in elem.iterdescendants():
+        yield ch
+
+def has_ancestor_named(el, names_lower_set):
+    p = el.getparent()
+    while p is not None:
+        if localname(p.tag).lower() in names_lower_set:
+            return True
+        p = p.getparent()
+    return False
+
+def first_desc_by_name(elem, name_lower, exclude_under=None):
+    """
+    Return first descendant by local-name (case-insensitive).
+    If exclude_under is a set of container names, skip nodes under those.
+    """
+    ex = set(n.lower() for n in (exclude_under or []))
+    for d in elem.iter():
+        if localname(d.tag).lower() == name_lower:
+            if ex and has_ancestor_named(d, ex):
+                continue
+            return d
+    return None
+
+def all_desc_by_name(elem, name_lower, exclude_under=None):
+    ex = set(n.lower() for n in (exclude_under or []))
+    for d in elem.iter():
+        if localname(d.tag).lower() == name_lower:
+            if ex and has_ancestor_named(d, ex):
+                continue
+            yield d
+
+# ---------- Structured extractors (walker-based) ----------
+_LIST_CONTAINERS = {
+    "agency_contact_list",
+    "timetable_list",
+    "legal_dline_list",
+    "cfr_list",
+    "legal_authority_list",
+    "small_entity_list",
+    "govt_level_list",
+    "related_rin_list",
+    "unfunded_mandate_list",
+}
+
+def extract_publication(rin_info):
     out = {}
-    pub = elem.find(".//*[local-name()='PUBLICATION']")
+    pub = first_desc_by_name(rin_info, "publication", exclude_under=_LIST_CONTAINERS)
     if pub is not None:
-        pid   = pub.find(".//*[local-name()='PUBLICATION_ID']")
-        pttl  = pub.find(".//*[local-name()='PUBLICATION_TITLE']")
-        out["publication_id"]    = t(pid.text) if pid is not None else ""
+        pid = first_desc_by_name(pub, "publication_id")
+        pttl = first_desc_by_name(pub, "publication_title")
+        out["publication_id"] = t(pid.text) if pid is not None else ""
         out["publication_title"] = t(pttl.text) if pttl is not None else ""
     return out
 
-def extract_agency(elem, tag_name):
-    out = {}
-    tag = elem.find(f".//*[local-name()='{tag_name}']")
-    if tag is not None:
-        code = tag.find(".//*[local-name()='CODE']")
-        name = tag.find(".//*[local-name()='NAME']")
-        acr  = tag.find(".//*[local-name()='ACRONYM']")
-        out[f"{tag_name.lower()}_code"]    = t(code.text) if code is not None else ""
-        out[f"{tag_name.lower()}_name"]    = t(name.text) if name is not None else ""
-        out[f"{tag_name.lower()}_acronym"] = t(acr.text) if acr is not None else ""
-    else:
-        out[f"{tag_name.lower()}_code"]    = ""
-        out[f"{tag_name.lower()}_name"]    = ""
-        out[f"{tag_name.lower()}_acronym"] = ""
+def extract_agency_block(rin_info, block_name):
+    """
+    Extract AGENCY / PARENT_AGENCY (not those nested under CONTACTs)
+    """
+    out = {f"{block_name}_name": "", f"{block_name}_code": "", f"{block_name}_acronym": ""}
+    blk = first_desc_by_name(rin_info, block_name, exclude_under={"agency_contact_list"})
+    if blk is None:
+        return out
+    code = first_desc_by_name(blk, "code")
+    name = first_desc_by_name(blk, "name")
+    acr  = first_desc_by_name(blk, "acronym")
+    out[f"{block_name}_code"]    = t(code.text) if code is not None else ""
+    out[f"{block_name}_name"]    = t(name.text) if name is not None else ""
+    out[f"{block_name}_acronym"] = t(acr.text)  if acr  is not None else ""
+    # duplicate 'name' into shorthand 'agency' / 'parent_agency' for convenience
+    if block_name == "agency":
+        out["agency"] = out["agency_name"]
+    if block_name == "parent_agency":
+        out["parent_agency"] = out["parent_agency_name"]
     return out
 
-def list_texts(elem, list_tag, item_tag):
+def list_texts(rin_info, list_tag, item_tag):
     arr = []
-    lst = elem.find(f".//*[local-name()='{list_tag}']")
-    if lst is None:
-        return arr
-    for it in lst.findall(f".//*[local-name()='{item_tag}']"):
-        arr.append(t(it.text))
+    for lst in all_desc_by_name(rin_info, list_tag):
+        # keep only items inside this list container
+        for d in lst.iter():
+            if localname(d.tag).lower() == item_tag:
+                if has_ancestor_named(d, {list_tag}) and not has_ancestor_named(d, {"agency_contact_list"}):
+                    arr.append(t(d.text))
     return arr
 
-def extract_related_rins(elem):
+def extract_related_rins(rin_info):
     out = []
-    lst = elem.find(".//*[local-name()='RELATED_RIN_LIST']")
-    if lst is None:
-        return out
-    for rr in lst.findall(".//*[local-name()='RELATED_RIN']"):
-        r = rr.find(".//*[local-name()='RIN']")
-        rel = rr.find(".//*[local-name()='RIN_RELATION']")
-        out.append({"rin": t(r.text) if r is not None else "",
-                    "relation": t(rel.text) if rel is not None else ""})
+    for lst in all_desc_by_name(rin_info, "related_rin_list"):
+        for rr in lst.iter():
+            if localname(rr.tag).lower() == "related_rin":
+                rnode = first_desc_by_name(rr, "rin")
+                rel   = first_desc_by_name(rr, "rin_relation")
+                out.append({
+                    "rin": t(rnode.text) if rnode is not None else "",
+                    "relation": t(rel.text) if rel is not None else ""
+                })
     return out
 
-def extract_contacts(elem):
+def extract_contacts(rin_info):
     out = []
-    lst = elem.find(".//*[local-name()='AGENCY_CONTACT_LIST']")
-    if lst is None:
-        return out
-    for c in lst.findall(".//*[local-name()='CONTACT']"):
-        item = {}
-        for tag in ["PREFIX","FIRST_NAME","MIDDLE_NAME","LAST_NAME","TITLE","PHONE","FAX","EMAIL"]:
-            node = c.find(f".//*[local-name()='{tag}']")
-            if node is not None:
-                item[tag.lower()] = t(node.text)
-        # nested agency in contact
-        cag = c.find(".//*[local-name()='AGENCY']")
-        if cag is not None:
-            for tag in ["CODE","NAME","ACRONYM"]:
-                node = cag.find(f".//*[local-name()='{tag}']")
-                item[f"contact_agency_{tag.lower()}"] = t(node.text) if node is not None else ""
-        # address
-        addr = c.find(".//*[local-name()='MAILING_ADDRESS']")
-        if addr is not None:
-            for tag in ["STREET_ADDRESS","CITY","STATE","ZIP"]:
-                node = addr.find(f".//*[local-name()='{tag}']")
-                item[f"address_{tag.lower()}"] = t(node.text) if node is not None else ""
-        out.append(item)
+    for cl in all_desc_by_name(rin_info, "agency_contact_list"):
+        for c in cl.iter():
+            if localname(c.tag).lower() != "contact":
+                continue
+            item = {}
+            for tag in ["prefix","first_name","middle_name","last_name","title","phone","fax","email"]:
+                node = first_desc_by_name(c, tag)
+                if node is not None:
+                    item[tag] = t(node.text)
+            cag = first_desc_by_name(c, "agency")
+            if cag is not None:
+                for tag in ["code","name","acronym"]:
+                    node = first_desc_by_name(cag, tag)
+                    item[f"contact_agency_{tag}"] = t(node.text) if node is not None else ""
+            addr = first_desc_by_name(c, "mailing_address")
+            if addr is not None:
+                for tag in ["street_address","city","state","zip"]:
+                    node = first_desc_by_name(addr, tag)
+                    item[f"address_{tag}"] = t(node.text) if node is not None else ""
+            out.append(item)
     return out
 
-def extract_unfunded(elem):
-    # Some vintages wrap in UNFUNDED_MANDATE_LIST/UNFUNDED_MANDATE
+def extract_unfunded(rin_info):
     arr = []
-    lst = elem.find(".//*[local-name()='UNFUNDED_MANDATE_LIST']")
-    if lst is None:
-        return arr
-    for u in lst.findall(".//*[local-name()='UNFUNDED_MANDATE']"):
-        arr.append(t(u.text))
+    for lst in all_desc_by_name(rin_info, "unfunded_mandate_list"):
+        for u in lst.iter():
+            if localname(u.tag).lower() == "unfunded_mandate":
+                arr.append(t(u.text))
     return arr
 
-def extract_legal_deadlines(elem):
+def extract_legal_deadlines(rin_info):
     out = []
-    lst = elem.find(".//*[local-name()='LEGAL_DLINE_LIST']")
-    if lst is None:
-        return out
-    for info in lst.findall(".//*[local-name()='LEGAL_DLINE_INFO']"):
-        d = {}
-        for tag in ["DLINE_TYPE","DLINE_ACTION_STAGE","DLINE_DATE","DLINE_DESC"]:
-            node = info.find(f".//*[local-name()='{tag}']")
-            d[tag.lower()] = t(node.text) if node is not None else ""
-        out.append(d)
+    for lst in all_desc_by_name(rin_info, "legal_dline_list"):
+        for info in lst.iter():
+            if localname(info.tag).lower() != "legal_dline_info":
+                continue
+            d = {}
+            for tag in ["dline_type","dline_action_stage","dline_date","dline_desc"]:
+                node = first_desc_by_name(info, tag)
+                d[tag] = t(node.text) if node is not None else ""
+            out.append(d)
     return out
 
-def extract_timetable(elem):
+def extract_timetable(rin_info):
     out = []
-    lst = elem.find(".//*[local-name()='TIMETABLE_LIST']")
-    if lst is None:
-        return out
-    for tt in lst.findall(".//*[local-name()='TIMETABLE']"):
-        act = tt.find(".//*[local-name()='TTBL_ACTION']")
-        dte = tt.find(".//*[local-name()='TTBL_DATE']")
-        fr  = tt.find(".//*[local-name()='FR_CITATION']")
-        raw, iso = parse_tt_date(t(dte.text) if dte is not None else "")
-        out.append({"action": t(act.text) if act is not None else "",
-                    "date_raw": raw,
-                    "date_iso": iso,
-                    "fr_citation": t(fr.text) if fr is not None else ""})
+    for lst in all_desc_by_name(rin_info, "timetable_list"):
+        for tt in lst.iter():
+            if localname(tt.tag).lower() != "timetable":
+                continue
+            act = first_desc_by_name(tt, "ttbl_action") or first_desc_by_name(tt, "action")
+            dte = first_desc_by_name(tt, "ttbl_date")  or first_desc_by_name(tt, "date")
+            fr  = first_desc_by_name(tt, "fr_citation")
+            raw, iso = parse_tt_date(t(dte.text) if dte is not None else "")
+            out.append({
+                "action": t(act.text) if act is not None else "",
+                "date_raw": raw,
+                "date_iso": iso,
+                "fr_citation": t(fr.text) if fr is not None else ""
+            })
     return out
 
-# gather additional simple leaf fields (outside lists/contacts/agency blocks)
-_SIMPLE_EXCLUDE_ANCESTORS = {
-    "PUBLICATION","AGENCY","PARENT_AGENCY","AGENCY_CONTACT_LIST",
-    "TIMETABLE_LIST","LEGAL_DLINE_LIST","CFR_LIST","LEGAL_AUTHORITY_LIST",
-    "SMALL_ENTITY_LIST","GOVT_LEVEL_LIST","RELATED_RIN_LIST","UNFUNDED_MANDATE_LIST"
-}
+# ---------- Simple leaves (all remaining scalar fields) ----------
+_EXCLUDE_ANCESTOR = _LIST_CONTAINERS | {"agency", "parent_agency", "publication"}
 
-def collect_simple_leaves(rin_info_elem):
+def collect_scalar_leaves(rin_info):
     """
-    Capture leaf texts that are not in list/contacts/agency/publication blocks.
-    Keyed by local-name (upper snake). If duplicates, last one wins.
+    Collect scalar leaf texts outside known list/agency/publication containers.
+    Keys are canonicalized to lower-snake-case and alias-mapped.
+    If duplicates, last one wins.
     """
     out = {}
-    # Walk descendants
-    for el in rin_info_elem.iter():
-        ln = localname(el.tag)
-        if not ln or len(el) > 0:
-            continue  # not a leaf
-        # Ascend to check ancestor exclusions
-        p = el.getparent()
-        excluded = False
-        while p is not None and localname(p.tag) != "RIN_INFO":
-            if localname(p.tag) in _SIMPLE_EXCLUDE_ANCESTORS:
-                excluded = True
-                break
-            p = p.getparent()
-        if excluded:
+    for el in rin_info.iter():
+        if len(el) > 0:
             continue
-        # store text if non-empty
+        ln = localname(el.tag)
+        if not ln:
+            continue
+        # skip RIN (we handle separately)
+        if ln.lower() == "rin":
+            continue
+        if has_ancestor_named(el, _EXCLUDE_ANCESTOR):
+            continue
         val = t(el.text)
         if val == "":
             continue
-        # don't duplicate fields we handle structurally
-        if ln in {"RIN"}:
-            continue
-        key = ln.lower()
+        key = canon(ln)
         out[key] = val
+    # map commonly seen older variants if they slipped through
+    if "rule_title" in out and "title" not in out:
+        out["title"] = out["rule_title"]
+    if "rule_stage" in out and "stage" not in out:
+        out["stage"] = out["rule_stage"]
     return out
 
+# ---------- Core record iterator ----------
 def iter_rin_records(xml_path):
-    pub_ym_file = to_pub_ym_from_file(xml_path) or ""
-    ctx = etree.iterparse(xml_path, events=("end",), tag=None, recover=True, huge_tree=True)
+    pub_ym_file = to_pub_ym_from_file(xml_path)
+    ctx = etree.iterparse(xml_path, events=("end",), recover=True, huge_tree=True)
     for ev, el in ctx:
-        if localname(el.tag) == "RIN_INFO":
-            rec = {}
-            # base ids
-            rin_node = el.find(".//*[local-name()='RIN']")
-            rin = t(rin_node.text) if rin_node is not None else ""
-            if not rin:
-                el.clear()
-                continue
+        if localname(el.tag).lower() != "rin_info":
+            continue
 
-            rec["rin"] = rin
-            # publication (prefer tag, else filename)
-            pub = extract_publication(el)
-            rec.update(pub)
-            if not rec.get("publication_id"):
-                rec["publication_id"] = pub_ym_file
-            rec["pub_season"] = pub_season(rec.get("publication_id",""))
-            rec["source_xml"] = os.path.basename(xml_path)
-
-            # Agency + Parent agency
-            rec.update(extract_agency(el, "AGENCY"))
-            rec.update(extract_agency(el, "PARENT_AGENCY"))
-
-            # Lists
-            rec["cfr_list"]               = as_json_str(list_texts(el, "CFR_LIST", "CFR"))
-            rec["legal_authority_list"]   = as_json_str(list_texts(el, "LEGAL_AUTHORITY_LIST", "LEGAL_AUTHORITY"))
-            rec["small_entity_list"]      = as_json_str(list_texts(el, "SMALL_ENTITY_LIST", "SMALL_ENTITY"))
-            rec["govt_level_list"]        = as_json_str(list_texts(el, "GOVT_LEVEL_LIST", "GOVT_LEVEL"))
-            rec["unfunded_mandate_list"]  = as_json_str(extract_unfunded(el))
-            rec["related_rins"]           = as_json_str(extract_related_rins(el))
-            rec["contacts"]               = as_json_str(extract_contacts(el))
-            legal_deadlines               = extract_legal_deadlines(el)
-            rec["legal_deadline_list"]    = as_json_str(legal_deadlines)
-            # has_statutory_deadline flag
-            has_stat = 0
-            for d in legal_deadlines:
-                if d.get("dline_type","").strip().lower().startswith("statutory"):
-                    has_stat = 1
-                    break
-            rec["has_statutory_deadline"] = str(has_stat)
-
-            # Timetable
-            tt = extract_timetable(el)
-            rec["timetable_json"] = as_json_str(tt)
-
-            # Simple leaves (all scalar extras)
-            simple = collect_simple_leaves(el)
-            # Normalize a few common names for consistency
-            # Map older variants -> modern-ish names where helpful
-            # (we keep both if present)
-            if "rule_title" not in simple:
-                # 1995 uses RULE_TITLE; we've already normalized key to 'rule_title'
-                pass
-            rec.update(simple)
-
-            yield rec
+        # RIN
+        rin_node = first_desc_by_name(el, "rin")
+        rin = t(rin_node.text) if rin_node is not None else ""
+        if not rin:
             el.clear()
-            # free memory up the chain
-            parent = el.getparent()
-            while parent is not None and len(parent) > 0 and parent[0] is not None and parent[0].getprevious() is not None:
-                try:
-                    del parent[0]
-                except Exception:
-                    break
+            while el.getprevious() is not None:
+                del el.getparent()[0]
+            continue
 
+        rec = {"rin": rin}
+        # Publication id/title (prefer tag, else filename)
+        pub = extract_publication(el)
+        rec.update(pub)
+        if not rec.get("publication_id"):
+            rec["publication_id"] = pub_ym_file
+        rec["pub_season"] = pub_season(rec["publication_id"])
+        rec["source_xml"] = os.path.basename(xml_path)
+
+        # Agency & Parent agency
+        rec.update(extract_agency_block(el, "agency"))
+        rec.update(extract_agency_block(el, "parent_agency"))
+
+        # Lists
+        rec["cfr_list"]              = as_json_str(list_texts(el, "cfr_list", "cfr"))
+        rec["legal_authority_list"]  = as_json_str(list_texts(el, "legal_authority_list", "legal_authority"))
+        rec["small_entity_list"]     = as_json_str(list_texts(el, "small_entity_list", "small_entity"))
+        rec["govt_level_list"]       = as_json_str(list_texts(el, "govt_level_list", "govt_level"))
+        rec["unfunded_mandate_list"] = as_json_str(extract_unfunded(el))
+        rec["related_rins"]          = as_json_str(extract_related_rins(el))
+        rec["contacts"]              = as_json_str(extract_contacts(el))
+
+        # Legal deadlines (+ flag)
+        legal_deadlines = extract_legal_deadlines(el)
+        rec["legal_deadline_list"] = as_json_str(legal_deadlines)
+        has_stat = 0
+        for d in legal_deadlines:
+            if t(d.get("dline_type","")).lower().startswith("statutory"):
+                has_stat = 1
+                break
+        rec["has_statutory_deadline"] = str(has_stat)
+
+        # Timetable (issue-only) + per-issue latest
+        tts = extract_timetable(el)
+        rec["timetable_all"] = as_json_str(tts)
+        # latest within the same issue
+        latest_iso, latest_action = "", ""
+        if tts:
+            # pick max date_iso; break ties by action alpha to stabilize
+            tts_sorted = sorted(tts, key=lambda d: (d.get("date_iso",""), d.get("action","")))
+            latest_iso    = tts_sorted[-1].get("date_iso","") or ""
+            latest_action = tts_sorted[-1].get("action","")    or ""
+        rec["latest_action_date_in_issue"] = latest_iso
+        rec["latest_action_in_issue"]      = latest_action
+
+        # Scalars (everything else)
+        rec.update(collect_scalar_leaves(el))
+
+        yield rec
+
+        # Free memory for streaming
+        el.clear()
+        parent = el.getparent()
+        while parent is not None and parent.getprevious() is not None:
+            try:
+                del parent.getparent()[0]
+            except Exception:
+                break
+
+# ---------- Load all XMLs ----------
 def load_all_xml(ua_dir):
-    files = sorted([os.path.join(ua_dir, f) for f in os.listdir(ua_dir)
-                    if re.match(r"REGINFO_RIN_DATA_\d{6}\.xml$", f)])
+    files = sorted([
+        os.path.join(ua_dir, f)
+        for f in os.listdir(ua_dir)
+        if re.match(r"REGINFO_RIN_DATA_\d{6}\.xml$", f)
+    ])
     all_rows = []
     tt_long  = []
-    # dynamic union of columns
     for i, path in enumerate(files, 1):
         try:
             for rec in iter_rin_records(path):
                 all_rows.append(rec)
-                # explode timetable for long form
+                # explode timetable for long table
                 pub = rec.get("publication_id","")
                 rin = rec.get("rin","")
                 src = rec.get("source_xml","")
                 try:
-                    tt = json.loads(rec.get("timetable_json","[]"))
+                    tt = json.loads(rec.get("timetable_all","[]"))
                 except Exception:
                     tt = []
                 for item in tt:
@@ -354,171 +429,179 @@ def load_all_xml(ua_dir):
                         "ttbl_action": item.get("action",""),
                         "ttbl_date_raw": item.get("date_raw",""),
                         "ttbl_date_iso": item.get("date_iso",""),
-                        "fr_citation": item.get("fr_citation","")
+                        "fr_citation": item.get("fr_citation",""),
                     })
         except Exception as e:
             print(f"[WARN] Skipped {os.path.basename(path)}: {e}")
 
     if not all_rows:
         raise RuntimeError("Parsed 0 rows from UA XMLs.")
+
     df_rows = pd.DataFrame(all_rows)
     df_tt   = pd.DataFrame(tt_long) if tt_long else pd.DataFrame(
         columns=["rin","publication_id","source_xml","ttbl_action","ttbl_date_raw","ttbl_date_iso","fr_citation"]
     )
 
-    # coerce publication_id as 6-digit string
-    if "publication_id" in df_rows.columns:
-        df_rows["publication_id"] = df_rows["publication_id"].astype(str).str.replace(r"\D","",regex=True)
-    df_tt["publication_id"] = df_tt["publication_id"].astype(str).str.replace(r"\D","",regex=True)
+    # Normalize id columns
+    df_rows["publication_id"] = df_rows["publication_id"].astype(str).str.replace(r"\D","",regex=True)
+    if "rin" in df_rows.columns:
+        df_rows["rin"] = df_rows["rin"].astype(str).str.strip()
+    if not df_tt.empty:
+        df_tt["publication_id"] = df_tt["publication_id"].astype(str).str.replace(r"\D","",regex=True)
+        df_tt["rin"] = df_tt["rin"].astype(str).str.strip()
 
-    # ensure core cols exist
-    for c in ["rin","publication_id","source_xml","pub_season",
-              "agency_code","agency_name","agency_acronym",
-              "parent_agency_code","parent_agency_name","parent_agency_acronym"]:
+    # Ensure core columns exist no matter what (dynamic union preserved)
+    for c in ["agency","parent_agency","pub_season","source_xml",
+              "agency_name","agency_code","agency_acronym",
+              "parent_agency_name","parent_agency_code","parent_agency_acronym",
+              "latest_action_in_issue","latest_action_date_in_issue","timetable_all"]:
         if c not in df_rows.columns:
             df_rows[c] = ""
 
     return df_rows, df_tt
 
 def to_int_ym(ym):
-    try:
-        s = str(ym)
-        if len(s) == 6 and s.isdigit():
-            return int(s)
-    except Exception:
-        pass
-    return -1
+    s = str(ym)
+    return int(s) if len(s) == 6 and s.isdigit() else -1
 
-def last_issue_ck(df_rows, df_tt):
+# ---------- Build CK-style "last" ----------
+def build_last(df_rows, df_tt, start_ym=None, end_ym=None):
     """
-    Build CK-like 'last' table:
-      - For each RIN, pick the row with the largest publication_id (YYYYMM)
-      - Backfill selected descriptive fields (only if blank) from earlier issues
-      - Compute latest timetable *within that last issue only*
+    If start_ym & end_ym provided, restrict to that window; else use all rows.
+    Backfill **only scalar** fields; keep last issue's timetable & latest.
+    Return df with:
+      - last_pub_ym, source_xml_of_last
+      - timetable_all_last_issue
+      - latest_action_last_issue, latest_action_date_last_issue
+      - PLUS the full union of scalar columns (dynamic)
     """
-    # sort rows by publication_id ascending, then stable
-    rows = df_rows.copy()
+    if start_ym and end_ym:
+        rows = df_rows[(df_rows["publication_id"] >= start_ym) &
+                       (df_rows["publication_id"] <= end_ym)].copy()
+    else:
+        rows = df_rows.copy()
+
+    if rows.empty:
+        return rows.head(0)
+
     rows["pub_int"] = rows["publication_id"].apply(to_int_ym)
-    rows = rows.sort_values(["rin","pub_int"]).reset_index(drop=True)
+    rows = rows.sort_values(["rin","pub_int","publication_id"]).reset_index(drop=True)
 
-    # identify last idx per rin
+    # Identify last row per RIN in (window or full)
     last_idx = rows.groupby("rin")["pub_int"].idxmax()
-    keep = rows.loc[last_idx].copy()
-    keep = keep.sort_values(["pub_int","rin"]).reset_index(drop=True)
+    last_rows = rows.loc[last_idx].copy()
 
-    # Backfill fields if last issue blank
-    # Choose a set of backfillable fields (can be broad)
-    cannot_bf = {"rin","publication_id","source_xml","pub_season","timetable_json"}
-    backfill_cols = [c for c in rows.columns if c not in cannot_bf]
+    # Backfill only scalar columns:
+    # Non-backfillable identifiers / list-like fields
+    non_bf = {"rin","publication_id","pub_season","source_xml",
+              "timetable_all","latest_action_in_issue","latest_action_date_in_issue"}
+    # heuristics: any column ending with '_list' or named 'contacts' or 'related_rins' are list-like
+    for c in list(rows.columns):
+        if c.endswith("_list") or c in {"contacts","related_rins"}:
+            non_bf.add(c)
 
-    def backfill_group(g):
-        # g sorted ascending by pub_int
-        bf = g[backfill_cols].ffill().iloc[-1]  # forward-fill then take last
-        last = g.iloc[-1].copy()
+    backfill_cols = [c for c in rows.columns if c not in non_bf | {"pub_int"}]
+
+    # Build per-RIN backfilled scalars
+    parts = []
+    for rin, g in rows.groupby("rin", sort=False):
+        g2 = g.sort_values("pub_int")
+        # forward-fill across issues, take last
+        bf = g2[backfill_cols].ffill().iloc[-1]
+        last = g2.iloc[-1].copy()
         for c in backfill_cols:
             if t(str(last.get(c,""))) == "":
                 last[c] = bf.get(c,"")
-        return last
+        parts.append(last)
 
-    # Build BF table per rin
-    bf_parts = []
-    for rin, g in rows.groupby("rin", sort=False):
-        g2 = g.sort_values("pub_int")
-        bf_parts.append(backfill_group(g2))
-    bf_df = pd.DataFrame(bf_parts).reset_index(drop=True)
+    bf_df = pd.DataFrame(parts).reset_index(drop=True)
 
-    # Ensure we align the BF result to kept last-rows by rin
-    ck = keep.drop(columns=[c for c in keep.columns if c in backfill_cols], errors="ignore")\
-            .merge(bf_df[["rin"] + backfill_cols], on="rin", how="left")
+    # Compose CK/full-last by overwriting last_rows' scalar cols with backfilled values
+    result = last_rows.drop(columns=[c for c in last_rows.columns if c in backfill_cols], errors="ignore") \
+                      .merge(bf_df[["rin"] + backfill_cols], on="rin", how="left")
 
-    # Latest timetable (only from the last issue)
-    # Build quick index for last-issue timetables
-    df_tt2 = df_tt.copy()
-    df_tt2["pub_int"] = df_tt2["publication_id"].apply(to_int_ym)
-    # find each rin's last pub_int
-    last_pub = rows.groupby("rin")["pub_int"].max().reset_index().rename(columns={"pub_int":"last_pub_int"})
-    tt_last = df_tt2.merge(last_pub, on="rin", how="inner")
-    tt_last = tt_last[tt_last["pub_int"] == tt_last["last_pub_int"]].copy()
+    # Attach last-issue timetable & latest
+    last_tt_json = dict(zip(last_rows["rin"], last_rows["timetable_all"]))
+    result["timetable_all_last_issue"] = result["rin"].map(last_tt_json).fillna("")
 
-    # normalize date for max
-    tt_last["_dt_rank"] = tt_last["ttbl_date_iso"].apply(lambda s: s if s else "")
-    # pick the maximum iso date (string) per rin
-    # (YYYY-MM-DD string compares lexicographically)
-    agg = tt_last.sort_values(["_dt_rank","ttbl_action"]).groupby("rin").tail(1)
-    latest_map_date = dict(zip(agg["rin"], agg["ttbl_date_iso"]))
-    latest_map_act  = dict(zip(agg["rin"], agg["ttbl_action"]))
+    result["latest_action_last_issue"]       = result["rin"].map(dict(zip(last_rows["rin"], last_rows["latest_action_in_issue"]))).fillna("")
+    result["latest_action_date_last_issue"]  = result["rin"].map(dict(zip(last_rows["rin"], last_rows["latest_action_date_in_issue"]))).fillna("")
 
-    # attach to ck
-    ck["latest_date_in_last_issue"]   = ck["rin"].map(latest_map_date).fillna("")
-    ck["latest_action_in_last_issue"] = ck["rin"].map(latest_map_act).fillna("")
+    # Rename and tidy ids
+    result["last_pub_ym"]        = result["publication_id"]
+    result["source_xml_of_last"] = result["source_xml"]
+    result = result.drop(columns=["pub_int"], errors="ignore")
 
-    # keep also the last-issue timetable_json (not union across issues)
-    last_tt_json = {}
-    for _, r in keep.iterrows():
-        last_tt_json[r["rin"]] = r.get("timetable_json","")
-    ck["last_issue_timetable_json"] = ck["rin"].map(last_tt_json).fillna("")
+    # Reindex to ensure we keep the **full** union of columns (rows.columns union + new last* fields)
+    union_cols = list(sorted(set(rows.columns) | set(result.columns) |
+                             {"last_pub_ym","source_xml_of_last",
+                              "timetable_all_last_issue",
+                              "latest_action_last_issue","latest_action_date_last_issue"}))
+    result = result.reindex(columns=union_cols)
+    return result
 
-    # annotate last pub fields cleanly
-    ck["last_pub_ym"]   = ck["publication_id"]
-    ck["last_pub_file"] = ck["source_xml"]
-
-    # Final tidy
-    ck = ck.drop(columns=["pub_int"], errors="ignore")
-    return ck
-
+# ---------- Counts & plot ----------
 def write_counts_and_plot(df_rows):
-    # counts by year & season (distinct RINs per year-season)
+    # per publication_id
+    counts = df_rows.groupby("publication_id")["rin"].nunique().reset_index(name="n_rins")
+    counts = counts.sort_values("publication_id")
+    counts.to_csv(os.path.join(OUT_DIR, "ua_ck_counts.csv"), index=False)
+
+    # yearly Spring/Fall series
     yr = df_rows.copy()
     yr["year"] = yr["publication_id"].str.slice(0,4)
-    counts = (yr.groupby(["year","pub_season"])["rin"].nunique()
-                .reset_index()
-                .rename(columns={"rin":"n_rins"}))
-    counts.to_csv(os.path.join(OUT_DIR,"ua_ck_counts.csv"), index=False)
-
-    # yearly (distinct RINs by year)
-    by_year = (yr.groupby("year")["rin"].nunique().reset_index())
+    sf = yr.groupby(["year","pub_season"])["rin"].nunique().reset_index(name="n_rins")
+    pivot = sf.pivot(index="year", columns="pub_season", values="n_rins").fillna(0)
     plt.figure(figsize=(12,5))
-    plt.plot(by_year["year"], by_year["rin"], marker="o")
+    if "Spring" in pivot.columns:
+        plt.plot(pivot.index, pivot["Spring"], marker="o", label="Spring")
+    if "Fall" in pivot.columns:
+        plt.plot(pivot.index, pivot["Fall"], marker="o", label="Fall")
     plt.xticks(rotation=90)
     plt.xlabel("Year")
     plt.ylabel("Distinct RINs")
-    plt.title("Unified Agenda – Distinct RINs by Publication Year")
+    plt.title("Unified Agenda – Distinct RINs by Publication Year (Spring/Fall)")
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR,"ua_yearly_counts.png"))
+    plt.savefig(os.path.join(OUT_DIR, "ua_yearly_counts.png"))
     plt.close()
 
 def main():
-    print(f"[INFO] UA folder: {UA_DIR}")
-    print(f"[INFO] Output folder: {OUT_DIR}")
-    print(f"[INFO] CK window: {CK_START} - {CK_END}")
+    print(f"[INFO] UA folder:   {UA_DIR}")
+    print(f"[INFO] Output dir:  {OUT_DIR}")
+    print(f"[INFO] CK window:   {CK_START}–{CK_END}")
 
     df_rows, df_tt = load_all_xml(UA_DIR)
 
-    # Save per-issue rows
-    path_rows = os.path.join(OUT_DIR,"ua_rows.csv")
+    # Save per-issue (dynamic union preserved automatically)
+    path_rows = os.path.join(OUT_DIR, "ua_rows.csv")
     df_rows.to_csv(path_rows, index=False)
-    print(f"[INFO] Wrote per-issue rows: {path_rows}")
+    print(f"[INFO] Wrote ua_rows.csv: {len(df_rows):,} rows -> {path_rows}")
 
     # Save timetable long
-    path_tt = os.path.join(OUT_DIR,"ua_timetables.csv")
+    path_tt = os.path.join(OUT_DIR, "ua_timetables.csv")
     df_tt.to_csv(path_tt, index=False)
-    print(f"[INFO] Wrote timetables:    {path_tt}")
+    print(f"[INFO] Wrote ua_timetables.csv: {len(df_tt):,} rows -> {path_tt}")
 
-    # Build CK last
-    df_ck = last_issue_ck(df_rows, df_tt)
-    path_ck = os.path.join(OUT_DIR,"ua_ck_last.csv")
+    # CK-last (window 199510–201904)
+    df_ck = build_last(df_rows, df_tt, CK_START, CK_END)
+    path_ck = os.path.join(OUT_DIR, "ua_ck_last.csv")
     df_ck.to_csv(path_ck, index=False)
-    print(f"[INFO] Wrote CK-last rows:  {path_ck}")
+    print(f"[INFO] Wrote CK-last (window): {len(df_ck):,} rows -> {path_ck}")
 
-    # Summary & chart
-    print(f"[INFO] Issue-level rows parsed: {len(df_rows):,}")
-    print(f"[INFO] Distinct RINs (any issue): {df_rows['rin'].nunique():,}")
-    # CK window (for reference)
-    rows_in_win = df_rows[(df_rows["publication_id"] >= CK_START) & (df_rows["publication_id"] <= CK_END)]
-    print(f"[INFO] Distinct RINs in CK window: {rows_in_win['rin'].nunique():,}")
+    # Full-range last (for 2020–2024+ assessment)
+    df_full = build_last(df_rows, df_tt, None, None)
+    path_full = os.path.join(OUT_DIR, "ua_last_full.csv")
+    df_full.to_csv(path_full, index=False)
+    print(f"[INFO] Wrote last-over-full-range: {len(df_full):,} rows -> {path_full}")
+
+    # Quick stats
+    print(f"[INFO] Distinct RINs overall: {df_rows['rin'].nunique():,}")
+    in_ck = df_rows[(df_rows["publication_id"] >= CK_START) & (df_rows["publication_id"] <= CK_END)]
+    print(f"[INFO] Distinct RINs in CK window: {in_ck['rin'].nunique():,}")
 
     write_counts_and_plot(df_rows)
-    print(f"[INFO] Wrote counts & chart -> {os.path.join(OUT_DIR, 'ua_ck_counts.csv')} / ua_yearly_counts.png")
+    print(f"[INFO] Counts & plot -> {os.path.join(OUT_DIR,'ua_ck_counts.csv')} / ua_yearly_counts.png")
 
 if __name__ == "__main__":
     main()
