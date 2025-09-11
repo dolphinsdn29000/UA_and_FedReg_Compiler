@@ -32,7 +32,8 @@ from dateutil import parser as dateparser
 # 1) PATHS (Tony’s env)
 # =======================
 UA_DIR  = "/Users/tonymolino/Dropbox/Mac/Desktop/NEW_ML_REGULATIONS_PAPER 2/Unified_Agenda_Download/ua_main_data"
-OUT_DIR = os.path.join(UA_DIR, "_ck_out")
+OUT_DIR = "/Users/tonymolino/Dropbox/Mac/Desktop/PyProjects/UA_and_FEG_REG_COMPILER/UA_COMPILER/UA_COMPILER_OUTPUT_DATA"
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Compiled CSVs
