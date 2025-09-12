@@ -5,17 +5,83 @@
 #  2) ONE "last per RIN" CSV (keep only the last appearance of each RIN),
 #     with EO_13771_DESIGNATION backfilled from the latest prior non-blank.
 #
-# Uses the existing parser in ua_single_xml_to_csv.py (lxml-based).
-# -------------------------------------------------------------
+"""
+UA Directory Runner — WHY these steps and decisions
+===================================================
+
+What problem is this runner solving?
+------------------------------------
+We need an analysis‑ready table across *all* UA issues while preserving every field ever
+seen. Then we must reduce it to a single “last appearance per RIN” table for CK‑style
+work—without contaminating values across issues.
+
+Why import the parser by absolute file path?
+--------------------------------------------
+Project layouts and IDE scratch runners often make `sys.path` brittle. Dynamic import
+by file path guarantees we load the exact parser you’re editing, regardless of CWD or
+PyCharm configuration.
+
+Why add `source_xml` and keep a single combined CSV?
+----------------------------------------------------
+• Provenance and auditability: every row records the UA file it came from.
+• Consistent, de‑duplicated schema across files lets you re‑run downstream code without
+  chasing moving columns per vintage.
+
+Why the unified column order?
+-----------------------------
+We start from the parser’s stable superset, then append any extra columns discovered at
+runtime. This prevents accidental column loss and keeps the “identity” fields together.
+
+Why the “last‑per‑RIN” algorithm (publication_id, with filename fallback)?
+--------------------------------------------------------------------------
+• The UA’s `PUBLICATION_ID` is the canonical notion of an issue (YYYYMM). Some older
+  rows may omit it—so we fall back to YYYYMM parsed from the filename
+  (e.g., REGINFO_RIN_DATA_201810.xml). We then keep the row with the *max* issue per RIN.
+• Ties are broken deterministically by row order within the run (idempotent for the same
+  input set).
+
+Why backfill EO_13771_DESIGNATION only (and only from earlier issues)?
+----------------------------------------------------------------------
+• EO_13771 is a scalar administrative label that can be missing in a RIN’s final issue
+  even when present earlier. Backfilling improves coverage without polluting structural
+  blocks like timetables (which must remain last‑issue only).
+• We *never* backfill forward; we fill the last issue’s blank from the latest prior
+  non‑blank for *the same RIN*. A separate small log documents every fill.
+
+What this runner does NOT do (by design)
+----------------------------------------
+• It does not merge timetables across issues, nor compute “latest” across the RIN’s
+  history—those are per‑issue quantities.
+• It does not guess missing dates beyond safe month anchors.
+• It does not rely on XPath predicates that break on older namespaces.
+
+Operational notes
+-----------------
+• Paths are explicit and absolute to avoid CWD surprises.
+• If you move the repo, update:
+  - MODULE_PATH (parser file path)
+  - SRC_DIR (UA XML folder)
+  - OUT_DIR (where CSVs go)
+
+Outputs
+-------
+1) ua_all_flat.csv           → union of every issue across files (+ source_xml)
+2) ua_all_counts_by_file.csv → quick sanity by input file
+3) ua_all_last_per_rin.csv   → one row per RIN, from its latest issue
+4) ua_all_last_per_rin_eo13771_backfill_log.csv → optional audit of EO backfills
+
+"""
+
 
 import os
 import re
 import pandas as pd
-from ua_single_xml_to_csv import build_ua_csv_from_xml, _PREFERRED_ORDER
+import importlib.util, sys; _p="/Users/tonymolino/Dropbox/Mac/Desktop/PyProjects/UA_and_FEG_REG_COMPILER/UA_COMPILER/src/UA_COMPILER/UA_Parser_For_Single_xml_9_12_25.py"; _s=importlib.util.spec_from_file_location("ua_parser_single",_p); _m=importlib.util.module_from_spec(_s); sys.modules["ua_parser_single"]=_m; _s.loader.exec_module(_m); build_ua_csv_from_xml=_m.build_ua_csv_from_xml; _PREFERRED_ORDER=_m._PREFERRED_ORDER
 
 # --- Paths (your exact paths) ---
 SRC_DIR = "/Users/tonymolino/Dropbox/Mac/Desktop/PyProjects/UA_and_FEG_REG_COMPILER/UA_COMPILER/Unified_Agenda_xml_Data"
 OUT_DIR = "/Users/tonymolino/Dropbox/Mac/Desktop/PyProjects/UA_and_FEG_REG_COMPILER/UA_COMPILER/UA_COMPILER_OUTPUT_DATA"
+
 
 AGG_CSV = os.path.join(OUT_DIR, "ua_all_flat.csv")
 COUNTS_BY_FILE_CSV = os.path.join(OUT_DIR, "ua_all_counts_by_file.csv")
